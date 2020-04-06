@@ -1,65 +1,125 @@
 version: 2
-jobs:
-  build:
+references:
+  container_config: &container_config
     docker:
       - image: devdemisto/content-build:3.0.0.7332  # disable-secrets-detection
-    resource_class: medium+
-    parallelism: 2
+
+
+  workspace_root: &workspace_root
+    /home/circleci/
+
+  store_artifacts: &store_artifacts
+     store_artifacts:
+        path: artifacts
+        destination: artifacts
+        when: always
+
+  attach_workspace: &attach_workspace
+    attach_workspace:
+      at: *workspace_root
+  add_ssh_keys: &add_ssh_keys
+    add_ssh_keys:
+      fingerprints:
+        - "02:df:a5:6a:53:9a:f5:5d:bd:a6:fc:b2:db:9b:c9:47" # disable-secrets-detection
+        - "f5:25:6a:e5:ac:4b:84:fb:60:54:14:82:f1:e9:6c:f9" # disable-secrets-detection
+  prepare_environment: &prepare_environment
+    run:
+      name: Prepare Environment
+      when: always
+      command: |
+        if [ -n "${INSTANCE_TESTS}" ] && [ $CIRCLE_NODE_INDEX -ne 0 ] ;
+        then
+        echo "Skipping - instance tests tasks are running only in container number 0"
+        exit 0
+        fi
+        echo 'export CIRCLE_ARTIFACTS="/home/circleci/project/artifacts"' >> $BASH_ENV
+        echo 'export PATH="/home/circleci/.local/bin:${PWD}/node_modules/.bin:${PATH}"' >> $BASH_ENV # disable-secrets-detection
+        echo 'export PYTHONPATH="/home/circleci/project:${PYTHONPATH}"' >> $BASH_ENV
+        echo 'export DEMISTO_README_VALIDATION=true' >> $BASH_ENV
+        echo "=== sourcing $BASH_ENV ==="
+        source $BASH_ENV
+        sudo mkdir -p -m 777 $CIRCLE_ARTIFACTS
+        chmod +x ./Tests/scripts/*
+        chmod +x ./Tests/lastest_server_build_scripts/*
+        echo "Parameters: NIGHTLY: $NIGHTLY, NON_AMI_RUN: $NON_AMI_RUN, SERVER_BRANCH_NAME: $SERVER_BRANCH_NAME, INSTANCE_TESTS: $INSTANCE_TESTS"
+        if [ ! -e "venv" ]; then
+        echo "installing venv"
+        NO_HOOKS=1 SETUP_PY2=yes .hooks/bootstrap
+        source ./venv/bin/activate
+        pip install -r .circleci/build-requirements.txt
+        pip3 install -r .circleci/build-requirements.txt
+        else
+        echo "venv exists (from cache). activating"
+        source ./venv/bin/activate
+        fi
+        # Install node packages
+        npm install .
+        # store in bash env so we load our venv in each step
+        echo 'source /home/circleci/project/venv/bin/activate' >> $BASH_ENV
+        git config diff.renameLimit 6000
+        python --version
+        python3 --version
+        demisto-sdk --version
+  build_descriptor: &build_descriptor
+    run:
+      name: Build Content Descriptor
+      when: always
+      command: |
+        if [ $CIRCLE_NODE_INDEX -ne 0 ] ;
+          then
+            echo "Skipping - running only in container number 0"
+            exit 0
+        fi
+        if [ -n "${GITHUB_TOKEN}" ] ;
+          then
+            python3 release_notes.py $CONTENT_VERSION $GIT_SHA1 $CIRCLE_BUILD_NUM $SERVER_VERSION --github-token $GITHUB_TOKEN
+
+          else
+            python3 release_notes.py $CONTENT_VERSION $GIT_SHA1 $CIRCLE_BUILD_NUM $SERVER_VERSION
+        fi
+  create_artifact: &create_artifact
+    run:
+      name: Create Content Artifacts
+      when: always
+      command: |
+        if [ $CIRCLE_NODE_INDEX -ne 0 ] ;
+          then
+            echo "Skipping - running only in container number 0"
+            exit 0
+        fi
+          demisto-sdk create-content-artifacts -a $CIRCLE_ARTIFACTS
+          # create zip with contents of content_new.zip and content_test.zip for use in updating content on instances
+          cp "$CIRCLE_ARTIFACTS/content_new.zip" "$CIRCLE_ARTIFACTS/all_content.zip"
+          unzip -q "$CIRCLE_ARTIFACTS/content_test.zip" -d "test_content_dir"
+          zip -j "$CIRCLE_ARTIFACTS/all_content.zip" test_content_dir/*
+          rm -r test_content_dir
+  restore_cache: &restore_cache
+    restore_cache:
+      key: venv-{{ checksum "dev-requirements-py2.txt" }}-{{ checksum "dev-requirements-py3.txt" }}-{{ checksum ".circleci/build-requirements.txt" }}-{{ checksum "package-lock.json" }}
+
+  environment: &environment
     environment:
       CONTENT_VERSION: "20.4.0"
       SERVER_VERSION: "5.5.0"
       GIT_SHA1: "8e167aa32b7c7c76ca7d4ac2fa5fdae88be1b64f" # guardrails-disable-line disable-secrets-detection
+
+jobs:
+  build:
+    <<: *container_config
+    resource_class: medium+
+    parallelism: 2
+    <<: *environment
     steps:
       - checkout
       - setup_remote_docker
-      - restore_cache:
-          key: venv-{{ checksum "dev-requirements-py2.txt" }}-{{ checksum "dev-requirements-py3.txt" }}-{{ checksum ".circleci/build-requirements.txt" }}-{{ checksum "package-lock.json" }}
-      - run:
-          name: Prepare Environment
-          when: always
-          command: |
-            if [ -n "${INSTANCE_TESTS}" ] && [ $CIRCLE_NODE_INDEX -ne 0 ] ;
-              then
-                echo "Skipping - instance tests tasks are running only in container number 0"
-                exit 0
-            fi
-            echo 'export CIRCLE_ARTIFACTS="/home/circleci/project/artifacts"' >> $BASH_ENV
-            echo 'export PATH="/home/circleci/.local/bin:${PWD}/node_modules/.bin:${PATH}"' >> $BASH_ENV # disable-secrets-detection
-            echo 'export PYTHONPATH="/home/circleci/project:${PYTHONPATH}"' >> $BASH_ENV
-            echo 'export DEMISTO_README_VALIDATION=true' >> $BASH_ENV
-            echo "=== sourcing $BASH_ENV ==="
-            source $BASH_ENV
-            sudo mkdir -p -m 777 $CIRCLE_ARTIFACTS
-            chmod +x ./Tests/scripts/*
-            chmod +x ./Tests/lastest_server_build_scripts/*
-            echo "Parameters: NIGHTLY: $NIGHTLY, NON_AMI_RUN: $NON_AMI_RUN, SERVER_BRANCH_NAME: $SERVER_BRANCH_NAME, INSTANCE_TESTS: $INSTANCE_TESTS"
-            if [ ! -e "venv" ]; then
-              echo "installing venv"
-              NO_HOOKS=1 SETUP_PY2=yes .hooks/bootstrap
-              source ./venv/bin/activate
-              pip install -r .circleci/build-requirements.txt
-              pip3 install -r .circleci/build-requirements.txt
-            else
-              echo "venv exists (from cache). activating"
-              source ./venv/bin/activate
-            fi
-            # Install node packages
-            npm install .
-            # store in bash env so we load our venv in each step
-            echo 'source /home/circleci/project/venv/bin/activate' >> $BASH_ENV
-            git config diff.renameLimit 6000
-            python --version
-            python3 --version
-            demisto-sdk --version
+      - *restore_cache
+      - *prepare_environment
       - save_cache:
           paths:
             - venv
             - node_modules
           key: venv-{{ checksum "dev-requirements-py2.txt" }}-{{ checksum "dev-requirements-py3.txt" }}-{{ checksum ".circleci/build-requirements.txt" }}-{{ checksum "package-lock.json" }}
-      - add_ssh_keys:
-          fingerprints:
-            - "02:df:a5:6a:53:9a:f5:5d:bd:a6:fc:b2:db:9b:c9:47" # disable-secrets-detection
-            - "f5:25:6a:e5:ac:4b:84:fb:60:54:14:82:f1:e9:6c:f9" # disable-secrets-detection
+      - *add_ssh_keys
       - run:
           name: Check if CircleCI's config file is up to date
           when: always
@@ -167,22 +227,6 @@ jobs:
             fi
             python3 ./Tests/scripts/circleci_spell_checker.py $CIRCLE_BRANCH
       - run:
-          name: Build Content Descriptor
-          when: always
-          command: |
-            if [ $CIRCLE_NODE_INDEX -ne 0 ] ;
-              then
-                echo "Skipping - running only in container number 0"
-                exit 0
-            fi
-            if [ -n "${GITHUB_TOKEN}" ] ;
-              then
-                python3 release_notes.py $CONTENT_VERSION $GIT_SHA1 $CIRCLE_BUILD_NUM $SERVER_VERSION --github-token $GITHUB_TOKEN
-
-              else
-                python3 release_notes.py $CONTENT_VERSION $GIT_SHA1 $CIRCLE_BUILD_NUM $SERVER_VERSION
-            fi
-      - run:
           name: Common Server Documentation
           when: always
           command: |
@@ -202,21 +246,6 @@ jobs:
                 exit 0
             fi
             ./Documentation/docs_site_update.sh
-      - run:
-          name: Create Content Artifacts
-          when: always
-          command: |
-            if [ $CIRCLE_NODE_INDEX -ne 0 ] ;
-              then
-                echo "Skipping - running only in container number 0"
-                exit 0
-            fi
-            demisto-sdk create-content-artifacts -a $CIRCLE_ARTIFACTS
-            # create zip with contents of content_new.zip and content_test.zip for use in updating content on instances
-            cp "$CIRCLE_ARTIFACTS/content_new.zip" "$CIRCLE_ARTIFACTS/all_content.zip"
-            unzip -q "$CIRCLE_ARTIFACTS/content_test.zip" -d "test_content_dir"
-            zip -j "$CIRCLE_ARTIFACTS/all_content.zip" test_content_dir/*
-            rm -r test_content_dir
       - run:
           name: Run Unit Testing and Lint
           when: always
@@ -347,6 +376,23 @@ jobs:
                 ./Tests/lastest_server_build_scripts/run_installer_on_instance.sh
             fi
             python3 ./Tests/scripts/wait_until_server_ready.py
+      - *store_artifacts
+      - persist_to_workspace:
+          root: /home/circleci/
+          paths:
+            - project
+  Latest GA:
+    <<: *container_config
+    resource_class: medium+
+    <<: *environment
+    steps:
+      - *attach_workspace
+      - setup_remote_docker
+      - *restore_cache
+      - *add_ssh_keys
+      - *prepare_environment
+      - *build_descriptor
+      - *create_artifact
       - run:
           name: Run Tests - Latest GA
           shell: /bin/bash
@@ -368,6 +414,18 @@ jobs:
               else
                 ./Tests/lastest_server_build_scripts/run_tests.sh
             fi
+      - *store_artifacts
+  One Before GA:
+    <<: *container_config
+    resource_class: medium+
+    <<: *environment
+    steps:
+      - setup_remote_docker
+      - *attach_workspace
+      - *add_ssh_keys
+      - *prepare_environment
+      - *build_descriptor
+      - *create_artifact
       - run:
           name: Run Tests - One Before GA
           shell: /bin/bash
@@ -389,6 +447,18 @@ jobs:
               else
                 echo "Not AMI run, can't run on this version"
             fi
+      - *store_artifacts
+  Two Before GA:
+    <<: *container_config
+    resource_class: medium+
+    <<: *environment
+    steps:
+      - setup_remote_docker
+      - *attach_workspace
+      - *add_ssh_keys
+      - *prepare_environment
+      - *build_descriptor
+      - *create_artifact
       - run:
           name: Run Tests - Two Before GA
           shell: /bin/bash
@@ -410,6 +480,18 @@ jobs:
               else
                 echo "Not AMI run, can't run on this version"
             fi
+      - *store_artifacts
+  Server Master:
+    <<: *container_config
+    resource_class: medium+
+    <<: *environment
+    steps:
+      - setup_remote_docker
+      - *attach_workspace
+      - *add_ssh_keys
+      - *prepare_environment
+      - *build_descriptor
+      - *create_artifact
       - run:
           name: Run Tests - Server Master
           shell: /bin/bash
@@ -431,6 +513,18 @@ jobs:
             else
                 echo "Not AMI run, can't run on this version"
             fi
+      - *store_artifacts
+  Demisto PreGA:
+    <<: *container_config
+    resource_class: medium+
+    <<: *environment
+    steps:
+      - setup_remote_docker
+      - *attach_workspace
+      - *add_ssh_keys
+      - *prepare_environment
+      - *build_descriptor
+      - *create_artifact
       - run:
           name: Run Tests - Demisto PreGA
           shell: /bin/bash
@@ -455,6 +549,16 @@ jobs:
             else
                 echo "Not AMI run, can't run on this version"
             fi
+      - *store_artifacts
+  Finish Build:
+    <<: *container_config
+    resource_class: medium+
+    <<: *environment
+    steps:
+      - setup_remote_docker
+      - *attach_workspace
+      - *add_ssh_keys
+      - *prepare_environment
       - store_artifacts:
           path: artifacts
           destination: artifacts
@@ -525,10 +629,7 @@ jobs:
             python3 ./Tests/Marketplace/upload_packs.py -a $PACK_ARTIFACTS -e $EXTRACT_FOLDER -b 'marketplace-dist' -s $GCS_PATH -n $CIRCLE_BUILD_NUM -k $PACK_SIGNING_KEY -p 'All' -pb 'marketplace-dist-private' -o
             rm $GCS_PATH
           when: on_success
-      - store_artifacts:
-          path: artifacts
-          destination: artifacts
-          when: always
+      - *store_artifacts
       - run:
           name: Store Artifacts to GCS
           command: ./Tests/scripts/upload_artifacts.sh
@@ -539,3 +640,25 @@ workflows:
   commit:
     jobs:
       - build
+      - Latest GA:
+          requires:
+            - build
+      - One Before GA:
+          requires:
+            - build
+      - Two Before GA:
+          requires:
+            - build
+      - Server Master:
+          requires:
+            - build
+      - Demisto PreGA:
+          requires:
+            - build
+      - Finish Build:
+          requires:
+            - Latest GA
+            - One Before GA
+            - Two Before GA
+            - Server Master
+            - Demisto PreGA
